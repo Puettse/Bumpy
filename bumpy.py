@@ -7,6 +7,7 @@ import os
 TOKEN = os.getenv("DISCORD_TOKEN")  # Railway variable
 CONFIG_FILE = "config.json"
 
+# Load / Save Config
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
@@ -21,10 +22,13 @@ config = load_config()
 bump_channel_id = config.get("bump_channel_id")
 log_channel_id = config.get("log_channel_id")
 
+# ✅ Intents fixed
 intents = discord.Intents.default()
+intents.message_content = True  # allow bot to read message text
 bot = commands.Bot(command_prefix="$", intents=intents)
 
 bump_task = None
+
 
 async def log_message(msg: str):
     if log_channel_id:
@@ -32,6 +36,7 @@ async def log_message(msg: str):
         if channel:
             await channel.send(msg)
     print(msg)
+
 
 async def bump_loop():
     await bot.wait_until_ready()
@@ -43,9 +48,13 @@ async def bump_loop():
                 await log_message(f"Bumpy bumped in <#{bump_channel_id}>")
         await asyncio.sleep(2 * 60 * 60 + 60)  # 2h 1m
 
+
 @bot.event
 async def on_ready():
     print(f"Bumpy is online as {bot.user}!")
+
+
+# -------- Commands --------
 
 @bot.command(name="start")
 async def start_bump(ctx):
@@ -56,6 +65,7 @@ async def start_bump(ctx):
     else:
         await ctx.send("Bumpy is already bumping.")
 
+
 @bot.command(name="end")
 async def end_bump(ctx):
     global bump_task
@@ -65,6 +75,7 @@ async def end_bump(ctx):
         await ctx.send("Bumpy stopped bumping.")
     else:
         await ctx.send("No bump loop is running.")
+
 
 @bot.command(name="assign")
 async def assign_channel(ctx, *, arg):
@@ -77,6 +88,7 @@ async def assign_channel(ctx, *, arg):
     except ValueError:
         await ctx.send("Invalid channel ID.")
 
+
 @bot.command(name="log")
 async def log_channel(ctx, *, arg):
     global log_channel_id
@@ -88,9 +100,11 @@ async def log_channel(ctx, *, arg):
     except ValueError:
         await ctx.send("Invalid channel ID.")
 
+
 @bot.command(name="restart")
 async def restart_bump(ctx):
     await end_bump(ctx)
     await start_bump(ctx)
+
 
 bot.run(TOKEN)
