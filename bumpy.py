@@ -39,7 +39,7 @@ def get_or_create_user(user_id):
 # --- Discord Bot Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="$", intents=intents)
+bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)  # disable default help
 
 # --- Commands ---
 
@@ -255,7 +255,6 @@ async def reminder_loop():
             if (now - last_dt).total_seconds() < data["interval"] * 60:
                 continue
 
-        # Build reminder
         inc = data["increment"]
         unit = data["unit"]
         total = data["progress"]
