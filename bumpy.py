@@ -1,10 +1,9 @@
 import discord
 from discord.ext import commands, tasks
-import asyncio
 import json
 import os
 from datetime import datetime
-import pytz  # pip install pytz
+import pytz  # make sure in requirements.txt: pytz==2023.3
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CONFIG_FILE = "users.json"
@@ -31,8 +30,8 @@ def get_or_create_user(user_id):
             "timezone": "UTC",
             "last_reset": str(datetime.utcnow().date()),
             "last_reminder": None,
-            "reminder_channel": None,  # NEW
-            "log_channel": None        # NEW
+            "reminder_channel": None,
+            "log_channel": None
         }
         save_users(users)
     return users
@@ -61,7 +60,6 @@ async def set_goal(ctx, amount: int, unit: str, every: str, interval: int, per: 
     users[str(ctx.author.id)]["last_reminder"] = None
     save_users(users)
 
-    # Log if a log channel is set
     log_channel_id = users[str(ctx.author.id)].get("log_channel")
     if log_channel_id:
         log_channel = bot.get_channel(log_channel_id)
@@ -136,7 +134,26 @@ async def set_unit(ctx, unit: str):
     save_users(users)
     await ctx.send(f"{ctx.author.mention} Unit set to {unit.lower()}.")
 
-# --- NEW: Set reminder channel ---
+@bot.command(name="drink")
+async def drink(ctx, amount: int):
+    users = get_or_create_user(ctx.author.id)
+    user = users[str(ctx.author.id)]
+    if user["increment"] is None:
+        await ctx.send("You haven’t set a goal yet. Use `$setgoal` first.")
+        return
+
+    unit = user["unit"]
+    user["progress"] += amount
+    save_users(users)
+
+    display = f"{user['progress']} {unit}"
+    if unit == "oz" and user["progress"] >= 128:
+        display += f" ({user['progress']/128:.2f} gal)"
+    elif unit == "ml" and user["progress"] >= 1000:
+        display += f" ({user['progress']/1000:.2f} L)"
+
+    await ctx.send(f"{ctx.author.mention} Logged {amount} {unit}. Progress today: {display}.")
+
 @bot.command(name="reminderchannel")
 async def set_reminder_channel(ctx, channel_id: int):
     users = get_or_create_user(ctx.author.id)
@@ -144,13 +161,75 @@ async def set_reminder_channel(ctx, channel_id: int):
     save_users(users)
     await ctx.send(f"{ctx.author.mention} Reminder channel set to <#{channel_id}>.")
 
-# --- NEW: Set log channel ---
 @bot.command(name="logchannel")
 async def set_log_channel(ctx, channel_id: int):
     users = get_or_create_user(ctx.author.id)
     users[str(ctx.author.id)]["log_channel"] = channel_id
     save_users(users)
     await ctx.send(f"{ctx.author.mention} Log channel set to <#{channel_id}>.")
+
+# --- Help (Embed) ---
+@bot.command(name="help")
+async def help_command(ctx):
+    embed = discord.Embed(
+        title="💧 Bumpy Commands",
+        description="Use either the `$command` or the `b.#` shortcut",
+        color=discord.Color.blue()
+    )
+
+    embed.add_field(name="b.1 / $setgoal", value="Set hydration goal\n`$setgoal 8 oz every 1 hour`", inline=False)
+    embed.add_field(name="b.2 / $check", value="Check your current progress", inline=False)
+    embed.add_field(name="b.3 / $modifygoal", value="Update your hydration goal", inline=False)
+    embed.add_field(name="b.4 / $deletegoal", value="Delete your hydration goal", inline=False)
+    embed.add_field(name="b.5 / $timezone", value="Set your timezone\n`$timezone America/Chicago`", inline=False)
+    embed.add_field(name="b.6 / $unit", value="Switch unit system (oz/ml)", inline=False)
+    embed.add_field(name="b.7 / $drink", value="Log water intake\n`$drink 12`", inline=False)
+    embed.add_field(name="b.8 / $reminderchannel", value="Set channel for reminders", inline=False)
+    embed.add_field(name="b.9 / $logchannel", value="Set channel for logs", inline=False)
+    embed.add_field(name="b.10 / $help", value="Show this help menu", inline=False)
+
+    await ctx.send(embed=embed)
+
+# --- Aliases (b.1 ... b.10) ---
+@bot.command(name="b1")
+async def b1(ctx, amount: int, unit: str, every: str, interval: int, per: str = "hour"):
+    await set_goal(ctx, amount, unit, every, interval, per)
+
+@bot.command(name="b2")
+async def b2(ctx):
+    await check_progress(ctx)
+
+@bot.command(name="b3")
+async def b3(ctx, amount: int, unit: str, every: str, interval: int, per: str = "hour"):
+    await modify_goal(ctx, amount, unit, every, interval, per)
+
+@bot.command(name="b4")
+async def b4(ctx):
+    await delete_goal(ctx)
+
+@bot.command(name="b5")
+async def b5(ctx, tz: str):
+    await set_timezone(ctx, tz)
+
+@bot.command(name="b6")
+async def b6(ctx, unit: str):
+    await set_unit(ctx, unit)
+
+@bot.command(name="b7")
+async def b7(ctx, amount: int):
+    await drink(ctx, amount)
+
+@bot.command(name="b8")
+async def b8(ctx, channel_id: int):
+    await set_reminder_channel(ctx, channel_id)
+
+@bot.command(name="b9")
+async def b9(ctx, channel_id: int):
+    await set_log_channel(ctx, channel_id)
+
+@bot.command(name="b10")
+async def b10(ctx):
+    await help_command(ctx)
 
 # --- Reminder Loop ---
 @tasks.loop(minutes=1)
@@ -163,35 +242,31 @@ async def reminder_loop():
         tz = pytz.timezone(data.get("timezone", "UTC"))
         now = datetime.now(tz)
 
-        # reset daily
+        # Reset progress daily
         if data.get("last_reset") != str(now.date()):
             data["progress"] = 0
             data["last_reset"] = str(now.date())
             data["last_reminder"] = None
 
-        # check interval
+        # Check interval
         last_reminder = data.get("last_reminder")
         if last_reminder:
             last_dt = datetime.fromisoformat(last_reminder)
             if (now - last_dt).total_seconds() < data["interval"] * 60:
                 continue
 
-        # where to send?
+        # Build reminder
         inc = data["increment"]
         unit = data["unit"]
         total = data["progress"]
+        reminder_msg = f"⏰ Time to drink {inc} {unit}! Progress today: {total} {unit}."
 
-        reminder_msg = (
-            f"⏰ Time to drink {inc} {unit}! "
-            f"Progress today: {total} {unit}."
-        )
-
+        # Send reminder
         if data.get("reminder_channel"):
             channel = bot.get_channel(data["reminder_channel"])
             if channel:
                 await channel.send(f"<@{uid}> {reminder_msg}")
         else:
-            # fallback: DM
             user = await bot.fetch_user(int(uid))
             if user:
                 await user.send(reminder_msg)
