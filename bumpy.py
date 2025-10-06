@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands, tasks
 import asyncpg
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -21,7 +21,9 @@ async def init_db():
     await conn.execute("""
     create table if not exists users (
       id bigint primary key,
-      increment int,
+      name text,
+      age int,
+      daily_goal int,
       unit text,
       interval int,
       timezone text,
@@ -99,31 +101,73 @@ def tz_now(tz_name: str) -> datetime:
         tz = pytz.UTC
     return datetime.now(tz)
 
+def convert_goal(unit_choice: int, number: int):
+    """Convert user input to consistent oz/ml base unit"""
+    if unit_choice == 1:  # oz
+        return number, "oz"
+    elif unit_choice == 2:  # cups (8 oz)
+        return number * 8, "oz"
+    elif unit_choice == 3:  # pints (16 oz)
+        return number * 16, "oz"
+    elif unit_choice == 4:  # gallons (128 oz)
+        return number * 128, "oz"
+    elif unit_choice == 5:  # ml
+        return number, "ml"
+    elif unit_choice == 6:  # liters (1000 ml)
+        return number * 1000, "ml"
+    else:
+        return None, None
+
 # ---------------- Commands ----------------
 @bot.command(name="config")
 async def config(ctx):
     def check(m): return m.author == ctx.author and m.channel == ctx.channel
 
-    # Amount
-    await ctx.send("💧 How much water per interval? (e.g., `8`)")
-    msg = await bot.wait_for("message", check=check)
+    # Name
+    await ctx.send("👋 What should I call you?")
+    name = (await bot.wait_for("message", check=check)).content.strip()
+
+    # Age
+    await ctx.send("📅 How old are you?")
+    age_msg = await bot.wait_for("message", check=check)
     try:
-        amount = int(msg.content)
+        age = int(age_msg.content.strip())
+    except:
+        return await ctx.send("❌ Invalid number for age.")
+
+    # Units & daily goal
+    await ctx.send(
+        "💧 Choose the unit for your daily goal:\n"
+        "1 = Ounces (oz)\n"
+        "2 = Cups (8 oz)\n"
+        "3 = Pints (16 oz)\n"
+        "4 = Gallons (128 oz)\n"
+        "5 = Milliliters (ml)\n"
+        "6 = Liters (1000 ml)"
+    )
+    unit_choice_msg = await bot.wait_for("message", check=check)
+    try:
+        unit_choice = int(unit_choice_msg.content.strip())
+    except:
+        return await ctx.send("❌ Invalid choice.")
+
+    await ctx.send("📊 Enter the number for your daily goal in that unit:")
+    num_msg = await bot.wait_for("message", check=check)
+    try:
+        num = int(num_msg.content.strip())
     except:
         return await ctx.send("❌ Invalid number.")
 
-    # Unit
-    await ctx.send("⚖️ Unit? (`oz` or `ml`)")
-    unit = (await bot.wait_for("message", check=check)).content.lower()
-    if unit not in ["oz", "ml"]:
-        return await ctx.send("❌ Invalid unit.")
+    daily_goal, base_unit = convert_goal(unit_choice, num)
+    if not daily_goal:
+        return await ctx.send("❌ Invalid selection.")
 
     # Interval
-    await ctx.send("⏱ How often? (`30 min` or `1 hour`)")
+    await ctx.send("⏱ How often should I remind you? (`30 min` or `1 hour`)")
     parts = (await bot.wait_for("message", check=check)).content.split()
     try:
-        num = int(parts[0]); per = parts[1].lower()
-        minutes = num * 60 if per.startswith("hour") else num
+        num_int = int(parts[0]); per = parts[1].lower()
+        minutes = num_int * 60 if per.startswith("hour") else num_int
     except:
         return await ctx.send("❌ Invalid format.")
 
@@ -147,45 +191,28 @@ async def config(ctx):
     await ctx.send("Ping yourself on reminders? (yes/no)")
     ping_self = (await bot.wait_for("message", check=check)).content.lower() in ["yes","y"]
 
-    # Coach role
-    await ctx.send("Enable coach pings? (yes/no)")
-    coach_enable = (await bot.wait_for("message", check=check)).content.lower() in ["yes","y"]
-    coach_role = None
-    coach_ping_logs = False
-    if coach_enable:
-        roles = [r for r in ctx.guild.roles if not r.is_default()]
-        if roles:
-            rlist = "\n".join([f"{i+1}. {r.mention}" for i, r in enumerate(roles)])
-            await ctx.send(f"👥 Select coach role (type number):\n{rlist}")
-            rchoice = int((await bot.wait_for("message", check=check)).content.strip())
-            coach_role = roles[rchoice-1].id
-            await ctx.send("Ping coach on logs? (yes/no)")
-            coach_ping_logs = (await bot.wait_for("message", check=check)).content.lower() in ["yes","y"]
-
-    # Save
     await upsert_user(ctx.author.id,
-        increment=amount,
-        unit=unit,
+        name=name,
+        age=age,
+        daily_goal=daily_goal,
+        unit=base_unit,
         interval=minutes,
         timezone=tz,
         reminder_channel=reminder_channel,
         log_channel=log_channel,
         ping_self=ping_self,
-        coach_role=coach_role,
-        coach_ping_logs=coach_ping_logs,
         last_reset=tz_now(tz).date()
     )
-    await ctx.send("✅ Configuration saved!")
+    await ctx.send(f"✅ Config saved! Daily goal = {daily_goal} {base_unit}")
 
 @bot.command(name="drink")
 async def drink(ctx, amount: int):
     user = await get_user(ctx.author.id)
     if not user:
         return await ctx.send("Run `$config` first.")
-    now = tz_now(user["timezone"])
-    await log_event(ctx.author.id, now, amount, user["unit"], "manual", f"<#{ctx.channel.id}>")
-    await add_daily_total(ctx.author.id, now.date(), amount)
-    await ctx.send(f"💧 Logged {amount} {user['unit']} for {ctx.author.mention}")
+    await log_event(ctx.author.id, tz_now(user["timezone"]), amount, user["unit"], "manual", str(ctx.channel.id))
+    await add_daily_total(ctx.author.id, tz_now(user["timezone"]).date(), amount)
+    await ctx.send(f"✅ Logged {amount} {user['unit']}")
 
 @bot.command(name="check")
 async def check(ctx):
@@ -193,55 +220,40 @@ async def check(ctx):
     if not user:
         return await ctx.send("Run `$config` first.")
     conn = await asyncpg.connect(DATABASE_URL)
-    today_total = await conn.fetchval(
-        "select coalesce(total,0) from daily_logs where user_id=$1 and date=$2",
-        ctx.author.id, tz_now(user["timezone"]).date()
-    )
+    row = await conn.fetchrow("SELECT total FROM daily_logs WHERE user_id=$1 AND date=$2", ctx.author.id, tz_now(user["timezone"]).date())
     await conn.close()
-    await ctx.send(f"{ctx.author.mention} Today: {today_total} {user['unit']} (Goal: {user['increment']} every {user['interval']}m)")
+    total = row["total"] if row else 0
+    await ctx.send(f"💧 Progress: {total}/{user['daily_goal']} {user['unit']} today.")
 
 @bot.command(name="report")
 async def report(ctx, days: int = 7):
-    if days not in [7,15,30]:
-        return await ctx.send("Use `$report 7`, `$report 15`, or `$report 30`.")
     user = await get_user(ctx.author.id)
     if not user:
         return await ctx.send("Run `$config` first.")
     conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch("""
-        select date, total from daily_logs
-        where user_id=$1
-        order by date desc
-        limit $2
-    """, ctx.author.id, days)
+    rows = await conn.fetch("SELECT date,total FROM daily_logs WHERE user_id=$1 ORDER BY date DESC LIMIT $2", ctx.author.id, days)
     await conn.close()
     if not rows:
-        return await ctx.send("No history yet.")
-    totals = [r["total"] for r in rows]
-    avg = sum(totals)/len(totals)
+        return await ctx.send("No logs yet.")
+    avg = sum(r["total"] for r in rows)//len(rows)
     best = max(rows, key=lambda r: r["total"])
     worst = min(rows, key=lambda r: r["total"])
-    embed = discord.Embed(title=f"{ctx.author.display_name}'s {days}-day report", color=discord.Color.blue())
-    embed.add_field(name="Average", value=f"{avg:.1f} {user['unit']}/day", inline=False)
-    embed.add_field(name="Best", value=f"{best['date']}: {best['total']} {user['unit']}", inline=True)
-    embed.add_field(name="Worst", value=f"{worst['date']}: {worst['total']} {user['unit']}", inline=True)
-    breakdown = "\n".join([f"{r['date']}: {r['total']} {user['unit']}" for r in rows])
-    embed.add_field(name="Breakdown", value=breakdown, inline=False)
-    await ctx.send(embed=embed)
+    msg = f"📊 {days}-day report:\nAvg: {avg} {user['unit']}\nBest: {best['total']} on {best['date']}\nWorst: {worst['total']} on {worst['date']}"
+    await ctx.send(msg)
 
 @bot.command(name="status")
 async def status(ctx):
     user = await get_user(ctx.author.id)
     if not user:
         return await ctx.send("Run `$config` first.")
-    embed = discord.Embed(title=f"📊 {ctx.author.display_name}'s Status", color=discord.Color.blurple())
-    embed.add_field(name="Goal", value=f"{user['increment']} {user['unit']} every {user['interval']}m", inline=False)
+    embed = discord.Embed(title=f"📊 {user['name']}'s Status", color=discord.Color.blurple())
+    embed.add_field(name="Age", value=user["age"], inline=True)
+    embed.add_field(name="Daily Goal", value=f"{user['daily_goal']} {user['unit']}", inline=False)
+    embed.add_field(name="Interval", value=f"{user['interval']} minutes", inline=False)
     embed.add_field(name="Timezone", value=user['timezone'], inline=True)
     embed.add_field(name="Reminder Channel", value=f"<#{user['reminder_channel']}>" if user['reminder_channel'] else "None", inline=True)
     embed.add_field(name="Log Channel", value=f"<#{user['log_channel']}>" if user['log_channel'] else "None", inline=True)
     embed.add_field(name="Ping Self", value=str(user['ping_self']), inline=True)
-    embed.add_field(name="Coach Role", value=f"<@&{user['coach_role']}>" if user['coach_role'] else "None", inline=True)
-    embed.add_field(name="Coach Ping Logs", value=str(user['coach_ping_logs']), inline=True)
     await ctx.send(embed=embed)
 
 @bot.command(name="help")
@@ -254,63 +266,64 @@ async def help_cmd(ctx):
     embed.add_field(name="$report <7|15|30>", value="Hydration reports", inline=False)
     await ctx.send(embed=embed)
 
-# ---------------- Reminder Loop ----------------
+# ---------------- Loops ----------------
 @tasks.loop(minutes=1)
 async def reminder_loop():
     conn = await asyncpg.connect(DATABASE_URL)
-    users = await conn.fetch("select * from users")
-    now_utc = datetime.utcnow().replace(tzinfo=pytz.UTC)
+    users = await conn.fetch("SELECT * FROM users")
+    now = datetime.utcnow()
 
-    for u in users:
-        if not u["increment"] or not u["interval"]:
-            continue
-        tz = u["timezone"] or "UTC"
-        now = tz_now(tz)
-        today = now.date()
+    for user in users:
+        tz = user["timezone"] or "UTC"
+        local_now = tz_now(tz)
+        last = user["last_reminder"]
 
-        # Reset at midnight
-        if u["last_reset"] != today:
-            total = await conn.fetchval("select coalesce(total,0) from daily_logs where user_id=$1 and date=$2",
-                                        u["id"], u["last_reset"])
-            if u["log_channel"]:
-                ch = bot.get_channel(u["log_channel"])
-                if ch:
-                    coach_ping = f" <@&{u['coach_role']}>" if u["coach_ping_logs"] and u["coach_role"] else ""
-                    await ch.send(f"🗓️ Daily summary for <@{u['id']}> {u['last_reset']}: {total} {u['unit']}{coach_ping}")
-            await conn.execute("update users set last_reset=$1 where id=$2", today, u["id"])
+        waking_hours = 16
+        reminders_per_day = max(1, waking_hours * 60 // user["interval"])
+        increment = user["daily_goal"] // reminders_per_day
 
-        # Reminder check
-        remind = False
-        if u["last_reminder"] is None:
-            remind = True
-        else:
-            delta = now_utc - u["last_reminder"]
-            if delta.total_seconds() >= u["interval"]*60:
-                remind = True
+        if not last or (now - last).total_seconds() >= user["interval"] * 60:
+            channel_id = user["reminder_channel"]
+            if channel_id:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    mention = f"<@{user['id']}>" if user["ping_self"] else ""
+                    await channel.send(f"💧 {mention} Time to drink ~ **{increment} {user['unit']}**!")
+                    await conn.execute("UPDATE users SET last_reminder=$1 WHERE id=$2", now, user["id"])
 
-        if remind:
-            msg = f"⏰ Time to drink {u['increment']} {u['unit']}!"
-            if u["ping_self"]:
-                msg = f"<@{u['id']}> " + msg
-            sent_where = "dm"
-            if u["reminder_channel"]:
-                ch = bot.get_channel(u["reminder_channel"])
-                if ch:
-                    await ch.send(msg)
-                    sent_where = f"<#{u['reminder_channel']}>"
-            else:
-                user = await bot.fetch_user(u["id"])
-                if user:
-                    await user.send(msg)
-            await conn.execute("update users set last_reminder=$1 where id=$2", now_utc, u["id"])
-            await add_daily_total(u["id"], today, u["increment"])
-            await log_event(u["id"], now, u["increment"], u["unit"], "reminder", sent_where)
+    await conn.close()
 
-            if u["log_channel"]:
-                log_ch = bot.get_channel(u["log_channel"])
-                if log_ch:
-                    coach_ping = f" <@&{u['coach_role']}>" if u["coach_ping_logs"] and u["coach_role"] else ""
-                    await log_ch.send(f"📥 +{u['increment']} {u['unit']} for <@{u['id']}> at {now.isoformat()}{coach_ping}")
+@tasks.loop(minutes=5)
+async def reset_loop():
+    conn = await asyncpg.connect(DATABASE_URL)
+    users = await conn.fetch("SELECT * FROM users")
+
+    for user in users:
+        tz = user["timezone"] or "UTC"
+        local_now = tz_now(tz)
+
+        if user["last_reset"] != local_now.date():
+            row = await conn.fetchrow(
+                "SELECT total FROM daily_logs WHERE user_id=$1 AND date=$2",
+                user["id"], local_now.date() - timedelta(days=1)
+            )
+            total = row["total"] if row else 0
+            channel_id = user["log_channel"]
+            if channel_id:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    percent = (total / user["daily_goal"]) * 100 if user["daily_goal"] else 0
+                    emoji = "🎯" if percent >= 100 else "💤"
+                    msg = (
+                        f"📅 Daily Summary for {local_now.date() - timedelta(days=1)}\n"
+                        f"💧 You drank {total}/{user['daily_goal']} {user['unit']} ({percent:.1f}%) {emoji}"
+                    )
+                    await channel.send(msg)
+
+            await conn.execute(
+                "UPDATE users SET last_reset=$1 WHERE id=$2",
+                local_now.date(), user["id"]
+            )
 
     await conn.close()
 
@@ -318,6 +331,7 @@ async def reminder_loop():
 async def on_ready():
     await init_db()
     reminder_loop.start()
+    reset_loop.start()
     print(f"Bumpy online as {bot.user}")
 
 bot.run(TOKEN)
