@@ -313,15 +313,77 @@ async def config(ctx):
     )
     await ctx.send(f"✅ Config saved! Daily goal = {daily_goal} {base_unit} • Every {interval} min • TZ: {tz}")
 
-@bot.command(name="drink")
-async def drink(ctx, amount: int):
+# --- DRINK COMMAND ---
+@bot.command(name="drink", aliases=["Drink", "DRINK", "dRiNk"])
+async def drink(ctx):
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+
+    # Step 1: Ask for unit
+    await ctx.send("💧 What unit are you logging in? (oz/ml)")
+    try:
+        unit_msg = await bot.wait_for("message", check=check, timeout=30.0)
+        log_unit = unit_msg.content.lower()
+        if log_unit not in ["oz", "ml"]:
+            await ctx.send("❌ Please choose either 'oz' or 'ml'.")
+            return
+    except asyncio.TimeoutError:
+        await ctx.send("⏰ You didn’t respond with a unit in time. Try again with `$drink`.")
+        return
+
+    # Step 2: Ask for amount
+    await ctx.send(f"💧 How many {log_unit}?")
+    try:
+        amt_msg = await bot.wait_for("message", check=check, timeout=30.0)
+        log_amount = int(amt_msg.content)
+    except asyncio.TimeoutError:
+        await ctx.send("⏰ You didn’t respond with an amount in time. Try again with `$drink`.")
+        return
+    except ValueError:
+        await ctx.send("❌ That wasn’t a valid number.")
+        return
+
+    # Step 3: Confirm + log to DB
     user = await get_user(ctx.author.id)
     if not user:
         return await ctx.send("Run `$config` first.")
-    now_local = tz_now(user["timezone"])
-    await log_event(ctx.author.id, now_local, amount, user["unit"], "manual", str(ctx.channel.id))
+
+    config_unit = user.get("unit", "ml")  # default to ml
+    amount = log_amount
+    final_unit = log_unit
+    display_extra = ""
+
+    # Conversion + dual display
+    if log_unit != config_unit:
+        if log_unit == "oz" and config_unit == "ml":
+            amount = round(log_amount * 29.5735)
+            display_extra = f"≈ {amount} ml"
+        elif log_unit == "ml" and config_unit == "oz":
+            amount = round(log_amount * 0.033814)
+            display_extra = f"≈ {amount} oz"
+        final_unit = config_unit
+    else:
+        # Show alternative unit anyway
+        if log_unit == "oz":
+            display_extra = f"(≈ {round(log_amount * 29.5735)} ml)"
+        else:
+            display_extra = f"(≈ {round(log_amount * 0.033814)} oz)"
+
+    now_local = tz_now(user["timezone"] or "UTC")
+    await log_event(ctx.author.id, now_local, amount, final_unit, "manual", str(ctx.channel.id))
     await add_daily_total(ctx.author.id, now_local.date(), amount)
-    await ctx.send(f"✅ Logged {amount} {user['unit']}")
+
+    confirmation = f"✅ Logged {log_amount} {log_unit} {display_extra}"
+    await ctx.send(confirmation)
+
+    # Optional: send to log channel if configured
+    if user.get("log_channel_id"):
+        log_channel = bot.get_channel(user["log_channel_id"])
+        if log_channel:
+            msg = f"📒 {ctx.author.display_name} logged {log_amount} {log_unit} {display_extra} at {now_local.strftime('%H:%M')}."
+            if user.get("coach_ping_logs") and user.get("coach_role_id"):
+                msg += f" <@&{user['coach_role_id']}>"
+            await log_channel.send(msg)
 
 @bot.command(name="check")
 async def check(ctx):
