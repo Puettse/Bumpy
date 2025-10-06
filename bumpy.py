@@ -1,397 +1,323 @@
 import discord
 from discord.ext import commands, tasks
-import json
+import asyncpg
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-CONFIG_FILE = "users.json"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ---------------- Storage helpers ----------------
-def load_users():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_users(users):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(users, f, indent=4)
-
-def ensure_user(user_id: int):
-    users = load_users()
-    sid = str(user_id)
-    if sid not in users:
-        users[sid] = {
-            "increment": None,
-            "unit": "oz",
-            "interval": None,            # minutes between reminders
-            "progress": 0,               # running total today
-            "timezone": "UTC",
-            "last_reset": None,          # yyyy-mm-dd in user's tz
-            "last_reminder": None,       # ISO timestamp in user's tz
-            "reminder_channel": None,
-            "log_channel": None,
-            "ping_self": False,
-            "coach_role": None,
-            "coach_ping_logs": False,
-
-            # NEW: historical logs & event timeline
-            "daily_logs": {},            # {"YYYY-MM-DD": total_amount}
-            "events": {},                # {"YYYY-MM-DD": [ {ts, amount, unit, kind, where} ]}
-            "last_archived_for": None    # last date (yyyy-mm-dd) we already archived & posted summary for
-        }
-        save_users(users)
-    return users
-
-def tz_now(tz_name: str) -> datetime:
-    tz = pytz.timezone(tz_name or "UTC")
-    return datetime.now(tz)
-
-def date_str(dt: datetime) -> str:
-    return dt.date().isoformat()
-
-def add_event(user: dict, when: datetime, amount: int, unit: str, kind: str, where: str):
-    d = date_str(when)
-    if "events" not in user or not isinstance(user["events"], dict):
-        user["events"] = {}
-    if d not in user["events"]:
-        user["events"][d] = []
-    # Save full ISO timestamp WITH timezone info
-    user["events"][d].append({
-        "ts": when.isoformat(),
-        "amount": amount,
-        "unit": unit,
-        "kind": kind,        # "reminder" or "manual"
-        "where": where       # "dm" or "<#channel_id>"
-    })
-
-# ---------------- Bot setup ----------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+
 bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
 
-# ---------------- Interactive CONFIG ----------------
+# ---------------- Database ----------------
+async def init_db():
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
+    create table if not exists users (
+      id bigint primary key,
+      increment int,
+      unit text,
+      interval int,
+      timezone text,
+      reminder_channel bigint,
+      log_channel bigint,
+      ping_self boolean,
+      coach_role bigint,
+      coach_ping_logs boolean,
+      last_reset date,
+      last_reminder timestamptz
+    );
+    """)
+    await conn.execute("""
+    create table if not exists daily_logs (
+      user_id bigint references users(id),
+      date date not null,
+      total int not null,
+      primary key (user_id, date)
+    );
+    """)
+    await conn.execute("""
+    create table if not exists events (
+      id bigserial primary key,
+      user_id bigint references users(id),
+      ts timestamptz not null,
+      amount int not null,
+      unit text not null,
+      kind text not null,
+      where_logged text
+    );
+    """)
+    await conn.close()
+
+async def get_user(uid: int):
+    conn = await asyncpg.connect(DATABASE_URL)
+    user = await conn.fetchrow("SELECT * FROM users WHERE id=$1", uid)
+    await conn.close()
+    return user
+
+async def upsert_user(uid: int, **kwargs):
+    conn = await asyncpg.connect(DATABASE_URL)
+    fields = ", ".join([f"{k} = ${i+2}" for i, k in enumerate(kwargs.keys())])
+    values = list(kwargs.values())
+    query = f"""
+        insert into users (id, {', '.join(kwargs.keys())})
+        values ($1, {', '.join([f'${i+2}' for i in range(len(kwargs))])})
+        on conflict (id) do update set {fields};
+    """
+    await conn.execute(query, uid, *values)
+    await conn.close()
+
+async def log_event(uid: int, ts: datetime, amount: int, unit: str, kind: str, where: str):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        "insert into events (user_id, ts, amount, unit, kind, where_logged) values ($1,$2,$3,$4,$5,$6)",
+        uid, ts, amount, unit, kind, where
+    )
+    await conn.close()
+
+async def add_daily_total(uid: int, date, amount: int):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
+        insert into daily_logs (user_id, date, total)
+        values ($1, $2, $3)
+        on conflict (user_id, date) do update
+        set total = daily_logs.total + EXCLUDED.total
+    """, uid, date, amount)
+    await conn.close()
+
+# ---------------- Helpers ----------------
+def tz_now(tz_name: str) -> datetime:
+    try:
+        tz = pytz.timezone(tz_name)
+    except:
+        tz = pytz.UTC
+    return datetime.now(tz)
+
+# ---------------- Commands ----------------
 @bot.command(name="config")
 async def config(ctx):
     def check(m): return m.author == ctx.author and m.channel == ctx.channel
 
-    users = ensure_user(ctx.author.id)
-    user = users[str(ctx.author.id)]
-
     # Amount
     await ctx.send("💧 How much water per interval? (e.g., `8`)")
+    msg = await bot.wait_for("message", check=check)
     try:
-        amount = int((await bot.wait_for("message", check=check)).content.strip())
+        amount = int(msg.content)
     except:
-        return await ctx.send("❌ Please provide a number (e.g., `8`). Start `$config` again.")
+        return await ctx.send("❌ Invalid number.")
 
     # Unit
-    await ctx.send("⚖️ What unit? (`oz` or `ml`)")
-    unit = (await bot.wait_for("message", check=check)).content.strip().lower()
+    await ctx.send("⚖️ Unit? (`oz` or `ml`)")
+    unit = (await bot.wait_for("message", check=check)).content.lower()
     if unit not in ["oz", "ml"]:
-        return await ctx.send("❌ Invalid unit. Start `$config` again.")
+        return await ctx.send("❌ Invalid unit.")
 
     # Interval
-    await ctx.send("⏱ How often? Type like `1 hour` or `30 min`")
-    parts = (await bot.wait_for("message", check=check)).content.strip().split()
-    if len(parts) < 2:
-        return await ctx.send("❌ Invalid format. Example: `1 hour` or `30 min`")
+    await ctx.send("⏱ How often? (`30 min` or `1 hour`)")
+    parts = (await bot.wait_for("message", check=check)).content.split()
     try:
-        interval_n = int(parts[0]); per = parts[1].lower()
+        num = int(parts[0]); per = parts[1].lower()
+        minutes = num * 60 if per.startswith("hour") else num
     except:
-        return await ctx.send("❌ Invalid format. Example: `1 hour` or `30 min`")
-    minutes = interval_n * 60 if per.startswith("hour") else interval_n
+        return await ctx.send("❌ Invalid format.")
 
     # Timezone
-    await ctx.send("🌍 What’s your timezone? (Example: `America/Chicago`)")
-    tz = (await bot.wait_for("message", check=check)).content.strip()
+    await ctx.send("🌍 Your timezone? (e.g., `America/Chicago`)")
+    tz = (await bot.wait_for("message", check=check)).content
     try:
         pytz.timezone(tz)
     except:
-        return await ctx.send("❌ Invalid timezone. Example: `America/Chicago`")
+        return await ctx.send("❌ Invalid timezone.")
 
-    # Channels (pick from list)
-    channels = [c for c in ctx.guild.text_channels]
-    if not channels:
-        return await ctx.send("❌ No text channels found in this server.")
-    listing = "\n".join([f"{i+1}. {c.mention}" for i, c in enumerate(channels)])
-    await ctx.send(f"🔔 Choose a **reminder** channel (type the number):\n{listing}")
-    try:
-        choice = int((await bot.wait_for("message", check=check)).content.strip())
-        reminder_channel = channels[choice-1].id
-    except:
-        return await ctx.send("❌ Invalid selection.")
+    # Channels
+    await ctx.send("🔔 Mention reminder channel (#channel)")
+    reminder_msg = await bot.wait_for("message", check=check)
+    reminder_channel = reminder_msg.channel_mentions[0].id if reminder_msg.channel_mentions else None
+    await ctx.send("📜 Mention log channel (#channel)")
+    log_msg = await bot.wait_for("message", check=check)
+    log_channel = log_msg.channel_mentions[0].id if log_msg.channel_mentions else None
 
-    await ctx.send(f"📜 Choose a **log** channel (type the number):\n{listing}")
-    try:
-        choice = int((await bot.wait_for("message", check=check)).content.strip())
-        log_channel = channels[choice-1].id
-    except:
-        return await ctx.send("❌ Invalid selection.")
+    # Ping self
+    await ctx.send("Ping yourself on reminders? (yes/no)")
+    ping_self = (await bot.wait_for("message", check=check)).content.lower() in ["yes","y"]
 
-    # Ping self?
-    await ctx.send("❓ Ping yourself on reminders? (yes/no)")
-    ping_self = (await bot.wait_for("message", check=check)).content.strip().lower() in ["yes", "y", "true", "1"]
-
-    # Coach pings?
-    await ctx.send("❓ Enable coach pings? (yes/no)")
-    coach_enable = (await bot.wait_for("message", check=check)).content.strip().lower() in ["yes", "y", "true", "1"]
+    # Coach role
+    await ctx.send("Enable coach pings? (yes/no)")
+    coach_enable = (await bot.wait_for("message", check=check)).content.lower() in ["yes","y"]
     coach_role = None
+    coach_ping_logs = False
     if coach_enable:
         roles = [r for r in ctx.guild.roles if not r.is_default()]
         if roles:
             rlist = "\n".join([f"{i+1}. {r.mention}" for i, r in enumerate(roles)])
-            await ctx.send(f"👥 Select a coach role (type the number):\n{rlist}")
-            try:
-                rchoice = int((await bot.wait_for("message", check=check)).content.strip())
-                coach_role = roles[rchoice-1].id
-            except:
-                return await ctx.send("❌ Invalid selection.")
-        else:
-            await ctx.send("ℹ️ No selectable roles found; skipping coach role.")
+            await ctx.send(f"👥 Select coach role (type number):\n{rlist}")
+            rchoice = int((await bot.wait_for("message", check=check)).content.strip())
+            coach_role = roles[rchoice-1].id
+            await ctx.send("Ping coach on logs? (yes/no)")
+            coach_ping_logs = (await bot.wait_for("message", check=check)).content.lower() in ["yes","y"]
 
-    # Ping coach on logs?
-    coach_ping_logs = False
-    if coach_role:
-        await ctx.send("❓ Ping coach on log messages? (yes/no)")
-        coach_ping_logs = (await bot.wait_for("message", check=check)).content.strip().lower() in ["yes", "y", "true", "1"]
-
-    # Save configuration
-    user.update({
-        "increment": amount,
-        "unit": unit,
-        "interval": minutes,
-        "progress": 0,
-        "timezone": tz,
-        "reminder_channel": reminder_channel,
-        "log_channel": log_channel,
-        "ping_self": ping_self,
-        "coach_role": coach_role,
-        "coach_ping_logs": coach_ping_logs,
-        "last_reset": date_str(tz_now(tz)),   # align today's date
-    })
-    save_users(users)
-
-    # Confirm
-    embed = discord.Embed(
-        title=f"✅ Configuration Complete for {ctx.author.display_name}",
-        color=discord.Color.green()
+    # Save
+    await upsert_user(ctx.author.id,
+        increment=amount,
+        unit=unit,
+        interval=minutes,
+        timezone=tz,
+        reminder_channel=reminder_channel,
+        log_channel=log_channel,
+        ping_self=ping_self,
+        coach_role=coach_role,
+        coach_ping_logs=coach_ping_logs,
+        last_reset=tz_now(tz).date()
     )
-    embed.add_field(name="Goal", value=f"{amount} {unit} every {interval_n} {per}", inline=False)
-    embed.add_field(name="Timezone", value=tz, inline=False)
-    embed.add_field(name="Reminder Channel", value=f"<#{reminder_channel}>", inline=False)
-    embed.add_field(name="Log Channel", value=f"<#{log_channel}>", inline=False)
-    embed.add_field(name="Ping Yourself", value=str(ping_self), inline=True)
-    embed.add_field(name="Coach Role", value=f"<@&{coach_role}>" if coach_role else "None", inline=True)
-    embed.add_field(name="Ping Coach on Logs", value=str(coach_ping_logs), inline=True)
-    await ctx.send(embed=embed)
+    await ctx.send("✅ Configuration saved!")
 
-# ---------------- User commands ----------------
 @bot.command(name="drink")
-async def drink(ctx, amount: int = None):
-    if amount is None:
-        return await ctx.send("Usage: `$drink <amount>` e.g. `$drink 12`")
-
-    users = ensure_user(ctx.author.id)
-    user = users[str(ctx.author.id)]
-    if not user.get("increment"):
-        return await ctx.send("No goal set. Run `$config` first.")
-
-    now = tz_now(user.get("timezone", "UTC"))
-    user["progress"] = int(user.get("progress", 0)) + int(amount)
-    add_event(user, now, int(amount), user.get("unit", "oz"), "manual", f"<#{ctx.channel.id}>")
-    save_users(users)
-
-    await ctx.send(f"{ctx.author.mention} Logged {amount} {user['unit']} @ {now.isoformat()}\n"
-                   f"Progress today: {user['progress']} {user['unit']}")
+async def drink(ctx, amount: int):
+    user = await get_user(ctx.author.id)
+    if not user:
+        return await ctx.send("Run `$config` first.")
+    now = tz_now(user["timezone"])
+    await log_event(ctx.author.id, now, amount, user["unit"], "manual", f"<#{ctx.channel.id}>")
+    await add_daily_total(ctx.author.id, now.date(), amount)
+    await ctx.send(f"💧 Logged {amount} {user['unit']} for {ctx.author.mention}")
 
 @bot.command(name="check")
 async def check(ctx):
-    users = ensure_user(ctx.author.id)
-    user = users[str(ctx.author.id)]
-    if not user.get("increment"):
-        return await ctx.send("No goal set. Run `$config` first.")
-
-    await ctx.send(
-        f"{ctx.author.mention} Goal: {user['increment']} {user['unit']} every {user['interval']} min\n"
-        f"Progress today: {user['progress']} {user['unit']}"
+    user = await get_user(ctx.author.id)
+    if not user:
+        return await ctx.send("Run `$config` first.")
+    conn = await asyncpg.connect(DATABASE_URL)
+    today_total = await conn.fetchval(
+        "select coalesce(total,0) from daily_logs where user_id=$1 and date=$2",
+        ctx.author.id, tz_now(user["timezone"]).date()
     )
+    await conn.close()
+    await ctx.send(f"{ctx.author.mention} Today: {today_total} {user['unit']} (Goal: {user['increment']} every {user['interval']}m)")
+
+@bot.command(name="report")
+async def report(ctx, days: int = 7):
+    if days not in [7,15,30]:
+        return await ctx.send("Use `$report 7`, `$report 15`, or `$report 30`.")
+    user = await get_user(ctx.author.id)
+    if not user:
+        return await ctx.send("Run `$config` first.")
+    conn = await asyncpg.connect(DATABASE_URL)
+    rows = await conn.fetch("""
+        select date, total from daily_logs
+        where user_id=$1
+        order by date desc
+        limit $2
+    """, ctx.author.id, days)
+    await conn.close()
+    if not rows:
+        return await ctx.send("No history yet.")
+    totals = [r["total"] for r in rows]
+    avg = sum(totals)/len(totals)
+    best = max(rows, key=lambda r: r["total"])
+    worst = min(rows, key=lambda r: r["total"])
+    embed = discord.Embed(title=f"{ctx.author.display_name}'s {days}-day report", color=discord.Color.blue())
+    embed.add_field(name="Average", value=f"{avg:.1f} {user['unit']}/day", inline=False)
+    embed.add_field(name="Best", value=f"{best['date']}: {best['total']} {user['unit']}", inline=True)
+    embed.add_field(name="Worst", value=f"{worst['date']}: {worst['total']} {user['unit']}", inline=True)
+    breakdown = "\n".join([f"{r['date']}: {r['total']} {user['unit']}" for r in rows])
+    embed.add_field(name="Breakdown", value=breakdown, inline=False)
+    await ctx.send(embed=embed)
 
 @bot.command(name="status")
 async def status(ctx):
-    users = ensure_user(ctx.author.id)
-    u = users[str(ctx.author.id)]
-    tz = u.get("timezone", "UTC")
-    embed = discord.Embed(title=f"📊 {ctx.author.display_name}'s Hydration Status", color=discord.Color.blurple())
-    if u.get("increment") and u.get("interval"):
-        embed.add_field(name="Goal", value=f"{u['increment']} {u['unit']} every {u['interval']} min", inline=False)
-    else:
-        embed.add_field(name="Goal", value="Not set", inline=False)
-    embed.add_field(name="Progress (today)", value=f"{u.get('progress',0)} {u.get('unit','oz')}", inline=False)
-    embed.add_field(name="Timezone", value=tz, inline=True)
-    embed.add_field(name="Reminder Channel", value=f"<#{u['reminder_channel']}>" if u.get("reminder_channel") else "None", inline=True)
-    embed.add_field(name="Log Channel", value=f"<#{u['log_channel']}>" if u.get("log_channel") else "None", inline=True)
-    embed.add_field(name="Ping Yourself", value=str(u.get("ping_self", False)), inline=True)
-    embed.add_field(name="Coach Role", value=f"<@&{u['coach_role']}>" if u.get("coach_role") else "None", inline=True)
-    embed.add_field(name="Ping Coach on Logs", value=str(u.get("coach_ping_logs", False)), inline=True)
+    user = await get_user(ctx.author.id)
+    if not user:
+        return await ctx.send("Run `$config` first.")
+    embed = discord.Embed(title=f"📊 {ctx.author.display_name}'s Status", color=discord.Color.blurple())
+    embed.add_field(name="Goal", value=f"{user['increment']} {user['unit']} every {user['interval']}m", inline=False)
+    embed.add_field(name="Timezone", value=user['timezone'], inline=True)
+    embed.add_field(name="Reminder Channel", value=f"<#{user['reminder_channel']}>" if user['reminder_channel'] else "None", inline=True)
+    embed.add_field(name="Log Channel", value=f"<#{user['log_channel']}>" if user['log_channel'] else "None", inline=True)
+    embed.add_field(name="Ping Self", value=str(user['ping_self']), inline=True)
+    embed.add_field(name="Coach Role", value=f"<@&{user['coach_role']}>" if user['coach_role'] else "None", inline=True)
+    embed.add_field(name="Coach Ping Logs", value=str(user['coach_ping_logs']), inline=True)
     await ctx.send(embed=embed)
 
-# ---------------- Reports with insights ----------------
-@bot.command(name="report")
-async def report(ctx, days: int = 7):
-    if days not in [7, 15, 30]:
-        return await ctx.send("Usage: `$report <7|15|30>`")
-
-    users = ensure_user(ctx.author.id)
-    u = users[str(ctx.author.id)]
-    logs = u.get("daily_logs", {})
-
-    if not logs:
-        return await ctx.send("No history yet. Bumpy will build logs automatically each midnight.")
-
-    # Sort by date desc and take last N days
-    sorted_days = sorted(logs.keys(), reverse=True)[:days]
-    if not sorted_days:
-        return await ctx.send("No data for that period.")
-
-    records = [(d, logs[d]) for d in sorted_days]
-    total = sum(v for _, v in records)
-    avg = total / len(records)
-    best_day, best_val = max(records, key=lambda x: x[1])
-    worst_day, worst_val = min(records, key=lambda x: x[1])
-
-    goal = None
-    if u.get("increment") and u.get("interval"):
-        # daily target estimated by intervals/day
-        goal = int((24*60) // int(u["interval"])) * int(u["increment"])
-    successes = sum(1 for _, v in records if goal is not None and v >= goal)
-
-    embed = discord.Embed(
-        title=f"📈 {ctx.author.display_name}'s {days}-Day Hydration Report",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="Average Intake", value=f"{avg:.1f} {u.get('unit','oz')}/day", inline=False)
-    embed.add_field(name="Best Day", value=f"{best_day}: {best_val} {u.get('unit','oz')}", inline=True)
-    embed.add_field(name="Worst Day", value=f"{worst_day}: {worst_val} {u.get('unit','oz')}", inline=True)
-    if goal is not None:
-        embed.add_field(name="Goal Success", value=f"{successes}/{len(records)} days met goal (~{(successes/len(records))*100:.0f}%)", inline=False)
-    breakdown = "\n".join([f"{d}: {v} {u.get('unit','oz')}" for d, v in records])
-    embed.add_field(name="Daily Breakdown", value=breakdown, inline=False)
+@bot.command(name="help")
+async def help_cmd(ctx):
+    embed = discord.Embed(title="💧 Bumpy Help", color=discord.Color.green())
+    embed.add_field(name="$config", value="Setup wizard", inline=False)
+    embed.add_field(name="$drink <amount>", value="Log intake", inline=False)
+    embed.add_field(name="$check", value="Check today’s progress", inline=False)
+    embed.add_field(name="$status", value="Show your config", inline=False)
+    embed.add_field(name="$report <7|15|30>", value="Hydration reports", inline=False)
     await ctx.send(embed=embed)
 
-# ---------------- Reminder & daily archive engine ----------------
+# ---------------- Reminder Loop ----------------
 @tasks.loop(minutes=1)
-async def engine():
-    users = load_users()
-    changed = False
+async def reminder_loop():
+    conn = await asyncpg.connect(DATABASE_URL)
+    users = await conn.fetch("select * from users")
+    now_utc = datetime.utcnow().replace(tzinfo=pytz.UTC)
 
-    for uid, u in users.items():
-        if not u.get("increment") or not u.get("interval"):
+    for u in users:
+        if not u["increment"] or not u["interval"]:
             continue
+        tz = u["timezone"] or "UTC"
+        now = tz_now(tz)
+        today = now.date()
 
-        tzname = u.get("timezone", "UTC")
-        now = tz_now(tzname)
-        today_str = date_str(now)
+        # Reset at midnight
+        if u["last_reset"] != today:
+            total = await conn.fetchval("select coalesce(total,0) from daily_logs where user_id=$1 and date=$2",
+                                        u["id"], u["last_reset"])
+            if u["log_channel"]:
+                ch = bot.get_channel(u["log_channel"])
+                if ch:
+                    coach_ping = f" <@&{u['coach_role']}>" if u["coach_ping_logs"] and u["coach_role"] else ""
+                    await ch.send(f"🗓️ Daily summary for <@{u['id']}> {u['last_reset']}: {total} {u['unit']}{coach_ping}")
+            await conn.execute("update users set last_reset=$1 where id=$2", today, u["id"])
 
-        # Initialize last_reset on first run
-        if not u.get("last_reset"):
-            u["last_reset"] = today_str
-            changed = True
-
-        # If we've crossed midnight in user's timezone, archive yesterday
-        if u.get("last_reset") != today_str:
-            # Archive previous day's total
-            yday = u["last_reset"]
-            if u.get("progress", 0) is not None:
-                if "daily_logs" not in u or not isinstance(u["daily_logs"], dict):
-                    u["daily_logs"] = {}
-                u["daily_logs"][yday] = int(u.get("progress", 0))
-            # Post a summary to log channel (once)
-            if u.get("log_channel"):
-                log_ch = bot.get_channel(u["log_channel"])
-                if log_ch:
-                    coach_ping = f" <@&{u['coach_role']}>" if u.get("coach_ping_logs") and u.get("coach_role") else ""
-                    await log_ch.send(
-                        f"🗓️ Daily summary for <@{uid}> ({yday}): {u.get('daily_logs',{}).get(yday,0)} {u.get('unit','oz')}.{coach_ping}"
-                    )
-            # Reset counters for new day
-            u["progress"] = 0
-            u["last_reset"] = today_str
-            u["last_reminder"] = None
-            changed = True
-
-        # Check reminder interval
-        last_ts = u.get("last_reminder")
-        interval_seconds = int(u["interval"]) * 60
-        should_remind = False
-        if last_ts is None:
-            should_remind = True
+        # Reminder check
+        remind = False
+        if u["last_reminder"] is None:
+            remind = True
         else:
-            try:
-                last_dt = datetime.fromisoformat(last_ts)
-                # Convert saved tz-aware string back to aware dt
-                last_dt = pytz.timezone(tzname).localize(last_dt.replace(tzinfo=None)) if last_dt.tzinfo is None else last_dt
-                if (now - last_dt).total_seconds() >= interval_seconds:
-                    should_remind = True
-            except Exception:
-                should_remind = True
+            delta = now_utc - u["last_reminder"]
+            if delta.total_seconds() >= u["interval"]*60:
+                remind = True
 
-        if should_remind:
-            # Compose & send reminder
-            inc = int(u["increment"]); unit = u.get("unit", "oz")
-            mention = f"<@{uid}>" if u.get("ping_self") else ""
+        if remind:
+            msg = f"⏰ Time to drink {u['increment']} {u['unit']}!"
+            if u["ping_self"]:
+                msg = f"<@{u['id']}> " + msg
             sent_where = "dm"
-            if u.get("reminder_channel"):
+            if u["reminder_channel"]:
                 ch = bot.get_channel(u["reminder_channel"])
                 if ch:
-                    await ch.send(f"{mention} ⏰ Time to drink {inc} {unit}! ({now.isoformat()})")
+                    await ch.send(msg)
                     sent_where = f"<#{u['reminder_channel']}>"
-                else:
-                    # fallback DM
-                    user = await bot.fetch_user(int(uid))
-                    if user:
-                        await user.send(f"{mention} ⏰ Time to drink {inc} {unit}! ({now.isoformat()})")
             else:
-                user = await bot.fetch_user(int(uid))
+                user = await bot.fetch_user(u["id"])
                 if user:
-                    await user.send(f"{mention} ⏰ Time to drink {inc} {unit}! ({now.isoformat()})")
+                    await user.send(msg)
+            await conn.execute("update users set last_reminder=$1 where id=$2", now_utc, u["id"])
+            await add_daily_total(u["id"], today, u["increment"])
+            await log_event(u["id"], now, u["increment"], u["unit"], "reminder", sent_where)
 
-            # Update progress and timestamps and event log
-            u["progress"] = int(u.get("progress", 0)) + inc
-            u["last_reminder"] = now.isoformat()
-            add_event(u, now, inc, unit, "reminder", sent_where)
-            changed = True
-
-            # Also log incremental intake in log channel (optional ping coach)
-            if u.get("log_channel"):
+            if u["log_channel"]:
                 log_ch = bot.get_channel(u["log_channel"])
                 if log_ch:
-                    coach_ping = f" <@&{u['coach_role']}>" if u.get("coach_ping_logs") and u.get("coach_role") else ""
-                    await log_ch.send(
-                        f"📥 {mention} +{inc} {unit} at {now.isoformat()} — total today: {u['progress']} {unit}.{coach_ping}"
-                    )
+                    coach_ping = f" <@&{u['coach_role']}>" if u["coach_ping_logs"] and u["coach_role"] else ""
+                    await log_ch.send(f"📥 +{u['increment']} {u['unit']} for <@{u['id']}> at {now.isoformat()}{coach_ping}")
 
-    if changed:
-        save_users(users)
+    await conn.close()
 
 @bot.event
 async def on_ready():
+    await init_db()
+    reminder_loop.start()
     print(f"Bumpy online as {bot.user}")
-    engine.start()
-
-# ---------------- Optional: help summary ----------------
-@bot.command(name="help")
-async def help_cmd(ctx):
-    embed = discord.Embed(title="💧 Bumpy — Hydration Assistant", color=discord.Color.blue())
-    embed.add_field(name="$config", value="Interactive setup wizard", inline=False)
-    embed.add_field(name="$drink <amount>", value="Log manual intake", inline=False)
-    embed.add_field(name="$check", value="Show today’s goal & progress", inline=False)
-    embed.add_field(name="$status", value="Show all settings", inline=False)
-    embed.add_field(name="$report <7|15|30>", value="Multi-day report with insights", inline=False)
-    await ctx.send(embed=embed)
 
 bot.run(TOKEN)
