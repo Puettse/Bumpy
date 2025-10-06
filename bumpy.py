@@ -301,7 +301,7 @@ async def config(ctx):
         age=age,
         daily_goal=daily_goal,
         unit=base_unit,
-        interval=interval,
+        interval_minutes=interval,
         timezone=tz,
         reminder_channel=reminder_channel,
         log_channel=log_channel,
@@ -436,7 +436,7 @@ async def status(ctx):
     embed = discord.Embed(title=f"📊 {user['name']}'s Status", color=discord.Color.blurple())
     embed.add_field(name="Age", value=user["age"], inline=True)
     embed.add_field(name="Daily Goal", value=f"{user['daily_goal']} {user['unit']}", inline=True)
-    embed.add_field(name="Interval", value=f"{user['interval']} minutes", inline=True)
+    embed.add_field(name="Interval", value=f"{user['interval_minutes']} minutes", inline=True)
     embed.add_field(name="Timezone", value=user['timezone'], inline=True)
     embed.add_field(name="Reminder Channel", value=f"<#{user['reminder_channel']}>" if user['reminder_channel'] else "None", inline=True)
     embed.add_field(name="Log Channel", value=f"<#{user['log_channel']}>" if user['log_channel'] else "None", inline=True)
