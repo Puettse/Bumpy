@@ -280,7 +280,7 @@ async def config(ctx):
             except Exception:
                 await ctx.send("❌ Invalid selection. Skipping coach role.")
                 coach_role_id = None
-            if coach_role_id:
+if coach_role_id:
     await ctx.send("📜 Ping coach role in **daily logs**? (yes/no)")
     coach_ping_logs = (await bot.wait_for("message", check=check)).content.strip().lower() in ["yes","y","true","1"]
 
