@@ -39,7 +39,7 @@ def get_or_create_user(user_id):
 # --- Discord Bot Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)  # disable default help
+bot = commands.Bot(command_prefix=["$", "b."], intents=intents, help_command=None)  # accept $ and b.
 
 # --- Commands ---
 
@@ -191,43 +191,43 @@ async def help_command(ctx):
     await ctx.send(embed=embed)
 
 # --- Aliases (b.1 ... b.10) ---
-@bot.command(name="b1")
+@bot.command(name="1")
 async def b1(ctx, amount: int, unit: str, every: str, interval: int, per: str = "hour"):
     await set_goal(ctx, amount, unit, every, interval, per)
 
-@bot.command(name="b2")
+@bot.command(name="2")
 async def b2(ctx):
     await check_progress(ctx)
 
-@bot.command(name="b3")
+@bot.command(name="3")
 async def b3(ctx, amount: int, unit: str, every: str, interval: int, per: str = "hour"):
     await modify_goal(ctx, amount, unit, every, interval, per)
 
-@bot.command(name="b4")
+@bot.command(name="4")
 async def b4(ctx):
     await delete_goal(ctx)
 
-@bot.command(name="b5")
+@bot.command(name="5")
 async def b5(ctx, tz: str):
     await set_timezone(ctx, tz)
 
-@bot.command(name="b6")
+@bot.command(name="6")
 async def b6(ctx, unit: str):
     await set_unit(ctx, unit)
 
-@bot.command(name="b7")
+@bot.command(name="7")
 async def b7(ctx, amount: int):
     await drink(ctx, amount)
 
-@bot.command(name="b8")
+@bot.command(name="8")
 async def b8(ctx, channel_id: int):
     await set_reminder_channel(ctx, channel_id)
 
-@bot.command(name="b9")
+@bot.command(name="9")
 async def b9(ctx, channel_id: int):
     await set_log_channel(ctx, channel_id)
 
-@bot.command(name="b10")
+@bot.command(name="10")
 async def b10(ctx):
     await help_command(ctx)
 
