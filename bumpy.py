@@ -281,10 +281,17 @@ async def config(ctx):
                 await ctx.send("❌ Invalid selection. Skipping coach role.")
                 coach_role_id = None
             if coach_role_id:
-                await ctx.send("📜 Ping coach role in **daily logs**? (yes/no)")
-                coach_ping_logs = (await bot.wait_for("message", check=check)).content.strip().lower() in ["yes","y","true","1"]
-                await ctx.send("🔔 Ping coach role in **reminders**? (yes/no)")
-                coach_ping_reminders = (await bot.wait_for("message", check=check)).content.strip().lower() in ["yes","y","true","1"]
+    await ctx.send("📜 Ping coach role in **daily logs**? (yes/no)")
+    coach_ping_logs = (await bot.wait_for("message", check=check)).content.strip().lower() in ["yes","y","true","1"]
+
+    await ctx.send("🔔 Ping coach role in **reminders**? (yes/no)")
+    try:
+        reply = await bot.wait_for("message", check=check, timeout=60)
+        coach_ping_reminders = reply.content.strip().lower() in ["yes","y","true","1"]
+        await ctx.send(f"✅ Coach role reminders set to {coach_ping_reminders}")
+    except asyncio.TimeoutError:
+        await ctx.send("⏳ No answer received, skipping coach reminder pings.")
+        coach_ping_reminders = False
 
     # Save config
     await upsert_user(
