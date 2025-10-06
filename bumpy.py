@@ -468,7 +468,7 @@ async def reminder_loop():
     now_utc = datetime.utcnow()
 
     for u in users:
-        if not u["interval"] or not u["daily_goal"]:
+        if not u["interval_minutes"] or not u["daily_goal"]:
             continue
 
         # Due?
@@ -477,7 +477,7 @@ async def reminder_loop():
             due = True
         else:
             elapsed = (now_utc - u["last_reminder"]).total_seconds()
-            if elapsed >= u["interval"] * 60:
+            if elapsed >= u["interval_minutes"] * 60:
                 due = True
         if not due:
             continue
@@ -487,7 +487,7 @@ async def reminder_loop():
 
         # Dynamic increment (assume 16 waking hours)
         waking_hours = 16
-        reminders_per_day = max(1, (waking_hours * 60) // u["interval"])
+        reminders_per_day = max(1, (waking_hours * 60) // u["interval_minutes"])
         increment = max(1, int(round(u["daily_goal"] / reminders_per_day)))
 
         # Compose & send
